@@ -55,7 +55,7 @@ def load_model_and_processor(config: Dict, use_qlora: bool = True):
         quantization_config=quantization_config, # Fixed: uses the correct variable
         device_map="auto",
         torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa", # Keep SDPA for A40/PyTorch 2.9 compatibility
+        attn_implementation="sdpa", # Revert to SDPA (GLIBC fix)
         trust_remote_code=True,     # Critical for Qwen3's new architecture
     )
 

@@ -37,9 +37,9 @@ CONFIG = {
                             "gate_proj", "up_proj", "down_proj"],
 
     # Training (OPTIMIZED FOR A40 GPU)
-    "num_epochs": 10,
+    "num_epochs": 3, # Reduced from 10 to 3 (sufficient for LoRA on 60k samples)
     "train_batch_size": 8,       # UPDATED: Increased from 2 -> 8 (Fits in A40 VRAM)
-    "eval_batch_size": 8,        # UPDATED: Match train batch
+    "eval_batch_size": 16,       # Doubled for speed (safe in eval mode)
     "gradient_accumulation_steps": 2,  # UPDATED: 8*2 = 16 effective batch size
     "dataloader_num_workers": 8, # NEW: Critical for speed (fixes CPU bottleneck)
     
@@ -49,8 +49,8 @@ CONFIG = {
     "bf16": True,
     "gradient_checkpointing": True,
     "logging_steps": 50,
-    "eval_steps": 1000,
-    "save_steps": 1000,
+    "eval_steps": 3000,          # Reduced frequency: Eval once per epoch (was 1000)
+    "save_steps": 3000,          # Save once per epoch
     "save_total_limit": 3,
 
     # Inference
