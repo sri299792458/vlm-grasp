@@ -1,127 +1,100 @@
 """
 Custom data collator for Qwen3-VL grasp training.
-Handles loss masking for chat format.
+Fixes Loss=0.0 by accurately calculating dynamic image token lengths.
 """
 import torch
 from dataclasses import dataclass
 from typing import Dict, List, Any
 from transformers import PreTrainedTokenizer
 
-
 @dataclass
 class GraspDataCollator:
-    """
-    Collator for Qwen3-VL chat format.
-    Masks loss on system/user turns, only computes on assistant response.
-    """
-
-    processor: Any  # Qwen3VLProcessor
+    processor: Any 
     tokenizer: PreTrainedTokenizer = None
 
     def __post_init__(self):
         if self.tokenizer is None:
             self.tokenizer = self.processor.tokenizer
+        
+        # CRITICAL FIX: Force right-padding. 
+        # If this is 'left', our masking indices will be wrong.
+        self.tokenizer.padding_side = 'right'
 
     def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
-        """
-        Collate batch and create labels with masking.
+        full_texts = []
+        prompt_texts = []
+        images = []
+        
+        for f in features:
+            messages = f['messages']
+            
+            # 1. Extract Image
+            user_content = messages[1]['content']
+            img_obj = None
+            for item in user_content:
+                if item['type'] == 'image':
+                    img_obj = item['image']
+                    break
+            if img_obj is None:
+                raise ValueError("No image found!")
+            images.append(img_obj)
+            
+            # 2. Get FULL text (User + Assistant)
+            full_str = self.processor.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=False
+            )
+            full_texts.append(full_str)
 
-        Args:
-            features: List of dicts from dataset
+            # 3. Get PROMPT text (User Only)
+            user_messages = messages[:-1]
+            prompt_str = self.processor.apply_chat_template(
+                user_messages, 
+                tokenize=False, 
+                add_generation_prompt=True 
+            )
+            prompt_texts.append(prompt_str)
 
-        Returns:
-            Batch dict with input_ids, attention_mask, labels, etc.
-        """
-        # Extract messages
-        messages_list = [f['messages'] for f in features]
-
-        # Process with Qwen processor (handles images, tokenization, padding)
+        # 4. Process FULL Batch (This is what we train on)
+        # padding=True will now use 'right' padding because of __post_init__
         batch = self.processor(
-            messages_list,
+            text=full_texts,
+            images=images,
             padding=True,
             return_tensors='pt',
         )
 
-        # Create labels by masking non-assistant tokens
+        # 5. Process PROMPT Batch (Just to measure lengths)
+        # padding=False gives us the exact unpadded length of the question+image
+        with torch.no_grad():
+            prompt_batch = self.processor(
+                text=prompt_texts,
+                images=images,
+                padding=False, 
+                return_tensors='pt' 
+            )
+            
+        # 6. Create Labels
         labels = batch['input_ids'].clone()
+        
+        # Mask padding (standard)
+        if self.tokenizer.pad_token_id is not None:
+            labels[labels == self.tokenizer.pad_token_id] = -100
 
-        # Mask padding tokens
-        labels[labels == self.tokenizer.pad_token_id] = -100
-
-        # Mask system and user turns (only compute loss on assistant)
-        # We need to find where the assistant response starts
+        # Mask User Prompts (The "Lens Method")
         for i in range(len(labels)):
-            input_ids = batch['input_ids'][i]
-            masked_labels = self._mask_non_assistant(input_ids)
-            labels[i] = masked_labels
+            # Get exact length of the prompt (including 1000+ image tokens)
+            if isinstance(prompt_batch['input_ids'], list):
+                p_len = len(prompt_batch['input_ids'][i])
+            else:
+                p_len = prompt_batch['input_ids'][i].shape[0]
+            
+            # Mask the prompt part. The rest (the answer) remains unmasked.
+            labels[i, :p_len] = -100
 
         batch['labels'] = labels
-
-        # Add metadata
-        batch['image_ids'] = [f['image_id'] for f in features]
-        batch['grasp_bins'] = [f['grasp_bins'] for f in features]
-
         return batch
 
-    def _mask_non_assistant(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Mask tokens before assistant response.
-
-        Args:
-            input_ids: (seq_len,)
-
-        Returns:
-            labels: (seq_len,) with -100 for masked positions
-        """
-        labels = input_ids.clone()
-
-        # Find assistant turn
-        # Qwen uses special format with <|im_start|>assistant\n
-        # We'll look for the assistant role token
-
-        # Decode to find pattern (hacky but works for research)
-        text = self.tokenizer.decode(input_ids, skip_special_tokens=False)
-
-        # Find "assistant" in decoded text
-        # Then find corresponding token index
-        assistant_markers = ['assistant', '<|im_start|>assistant']
-
-        assistant_start_idx = None
-        for marker in assistant_markers:
-            # Encode marker and search
-            marker_ids = self.tokenizer.encode(marker, add_special_tokens=False)
-            if len(marker_ids) == 0:
-                continue
-
-            # Search for marker in input_ids
-            for i in range(len(input_ids) - len(marker_ids) + 1):
-                if torch.all(input_ids[i:i+len(marker_ids)] == torch.tensor(marker_ids)):
-                    # Found it! Mask everything before end of marker
-                    assistant_start_idx = i + len(marker_ids)
-                    break
-
-            if assistant_start_idx is not None:
-                break
-
-        if assistant_start_idx is None:
-            # Fallback: mask first 80% (crude but avoids loss on prompt)
-            assistant_start_idx = int(len(input_ids) * 0.8)
-
-        # Mask everything before assistant response
-        labels[:assistant_start_idx] = -100
-
-        return labels
-
-
 def compute_grasp_metrics(eval_pred):
-    """
-    Compute metrics during evaluation.
-    For now just perplexity; full metrics done post-training.
-    """
-    predictions, labels = eval_pred
-    # predictions are logits, shape (batch, seq_len, vocab)
-
-    # Just return loss as metric
-    # (Trainer computes this automatically, but we can add more here)
-
     return {}

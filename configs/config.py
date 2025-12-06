@@ -5,10 +5,10 @@ Fast iteration research prototype style - just a simple dict!
 
 CONFIG = {
     # Paths
-    "ocid_grasp_path": "./ocid-grasp",  # Adjust to your download path
+    "ocid_grasp_path": "/scratch.global/kanth042/IRS_project/OCID_grasp",  # Correct global scratch path
     "model_name": "Qwen/Qwen3-VL-8B-Instruct",
-    "checkpoint_dir": "./checkpoints/qwen3-grasp-lora",
-    "results_dir": "./results",
+    "checkpoint_dir": "IRS/checkpoints/qwen3-grasp-lora",
+    "results_dir": "IRS/results",
 
     # Data
     "image_size": (480, 640),  # OCID-Grasp native size
@@ -36,19 +36,21 @@ CONFIG = {
     "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj"],
 
-    # Training
+    # Training (OPTIMIZED FOR A40 GPU)
     "num_epochs": 10,
-    "train_batch_size": 2,
-    "eval_batch_size": 4,
-    "gradient_accumulation_steps": 8,  # Effective batch = 16
+    "train_batch_size": 8,       # UPDATED: Increased from 2 -> 8 (Fits in A40 VRAM)
+    "eval_batch_size": 8,        # UPDATED: Match train batch
+    "gradient_accumulation_steps": 2,  # UPDATED: 8*2 = 16 effective batch size
+    "dataloader_num_workers": 8, # NEW: Critical for speed (fixes CPU bottleneck)
+    
     "learning_rate": 2e-4,
     "warmup_steps": 500,
     "lr_scheduler": "cosine",
     "bf16": True,
     "gradient_checkpointing": True,
     "logging_steps": 50,
-    "eval_steps": 500,
-    "save_steps": 500,
+    "eval_steps": 1000,
+    "save_steps": 1000,
     "save_total_limit": 3,
 
     # Inference

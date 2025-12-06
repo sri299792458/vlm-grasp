@@ -92,7 +92,7 @@ def test_loader():
         axes[i].axis('off')
 
     plt.tight_layout()
-    plt.savefig('data_loader_test.png', dpi=150, bbox_inches='tight')
+    plt.savefig('IRS/data_loader_test.png', dpi=150, bbox_inches='tight')
     print("\n\nVisualization saved to data_loader_test.png")
 
     # Test encode-decode round trip

@@ -76,7 +76,8 @@ def main(args):
 
     # Load model
     print("\nLoading model...")
-    model, processor = load_model_and_processor(config, use_qlora=True)
+    # Matches overfit settings (16-bit LoRA)
+    model, processor = load_model_and_processor(config, use_qlora=False)
 
     # Data collator
     data_collator = GraspDataCollator(processor=processor)
@@ -103,8 +104,13 @@ def main(args):
         greater_is_better=False,
         bf16=config['bf16'],
         gradient_checkpointing=config['gradient_checkpointing'],
-        dataloader_num_workers=4,
-        remove_unused_columns=False,  # Important for custom collator
+        dataloader_num_workers=8, 
+        remove_unused_columns=False,
+        
+        # --- THE FIX IS HERE ---
+        prediction_loss_only=True,  # Critical: Discards logits to prevent 90GB OOM
+        # -----------------------
+        
         report_to="none" if args.no_wandb else "wandb",
         run_name=args.run_name,
     )

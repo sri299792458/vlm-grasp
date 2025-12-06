@@ -55,7 +55,7 @@ def overfit_test(n_samples: int = 10, n_steps: int = 200):
     print(f"Overfitting on {len(tiny_dataset)} samples")
 
     # Load model
-    model, processor = load_model_and_processor(config, use_qlora=True)
+    model, processor = load_model_and_processor(config, use_qlora=False)
 
     # Data collator
     data_collator = GraspDataCollator(processor=processor)
@@ -64,10 +64,11 @@ def overfit_test(n_samples: int = 10, n_steps: int = 200):
     training_args = TrainingArguments(
         output_dir="./checkpoints/overfit_test",
         max_steps=n_steps,
-        per_device_train_batch_size=2,
+        per_device_train_batch_size=8,
         gradient_accumulation_steps=1,
         learning_rate=5e-4,  # Higher LR for fast overfitting
         logging_steps=10,
+        dataloader_num_workers=8,
         save_steps=1000,  # Don't save checkpoints
         bf16=config['bf16'],
         gradient_checkpointing=config['gradient_checkpointing'],
@@ -126,7 +127,19 @@ def overfit_test(n_samples: int = 10, n_steps: int = 200):
         from data.chat_formatter import format_inference_messages
 
         inference_msgs = format_inference_messages(np.array(image))
-        inputs = processor(inference_msgs, return_tensors='pt').to(model.device)
+        
+        # FIX: Separate Text and Image for the processor
+        text_prompt = processor.apply_chat_template(
+            inference_msgs, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        inputs = processor(
+            text=[text_prompt],
+            images=[image],
+            return_tensors='pt'
+        ).to(model.device)
 
         with torch.no_grad():
             outputs = model.generate(

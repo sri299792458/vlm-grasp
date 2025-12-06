@@ -135,7 +135,7 @@ class OCIDGraspDataset:
             'mask': item.get('mask', None),
             'target': item.get('target', 'unknown'),
             'sentence': item.get('sentence', ''),  # For OCID-VLG
-            'image_id': item.get('image_id', f'img_{len(self.samples)}'),
+            'image_id': item.get('image_id', 'img_unknown'),
         }
 
     def __len__(self) -> int:

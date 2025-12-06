@@ -3,60 +3,74 @@ Qwen3-VL model setup with LoRA for grasp prediction.
 """
 import torch
 from transformers import (
-    Qwen2VLForConditionalGeneration,
+    Qwen2VLForConditionalGeneration, # Keep for legacy if needed
     AutoProcessor,
     BitsAndBytesConfig,
+    AutoConfig,
+    AutoModelForCausalLM # Safest way to load if Qwen3 class is dynamic
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from typing import Dict, Optional
+# Try to import Qwen3 directly, fallback to AutoModel if not in this specific dev version
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+    MODEL_CLASS = Qwen3VLForConditionalGeneration
+except ImportError:
+    # Fallback for systems where Qwen3 is handled via remote code or AutoModel
+    MODEL_CLASS = AutoModelForCausalLM
 
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from typing import Dict
 
 def load_model_and_processor(config: Dict, use_qlora: bool = True):
     """
-    Load Qwen3-VL-8B with QLoRA configuration.
-
-    Args:
-        config: Config dict
-        use_qlora: Whether to use 4-bit quantization
-
-    Returns:
-        (model, processor)
+    Load Qwen3-VL-8B using the correct Qwen3 class and systematic config loading.
     """
     model_name = config['model_name']
-
     print(f"Loading {model_name}...")
 
-    # Load processor
+    # 1. Load Processor
     processor = AutoProcessor.from_pretrained(
         model_name,
         trust_remote_code=True
     )
 
-    # Quantization config
+    # 2. Setup Quantization Config (Fixed Variable Name)
     if use_qlora:
-        bnb_config = BitsAndBytesConfig(
+        quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,  # Double quantization for more memory savings
+            bnb_4bit_use_double_quant=True,
         )
         print("Using QLoRA (4-bit NF4)")
     else:
-        bnb_config = None
+        quantization_config = None
         print("Using full precision")
 
-    # Load model
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    # 3. Load Model (Systematic Fix)
+    # We use the specific Qwen3 class or AutoModel to respect the Qwen3VLVisionConfig
+    print(f"Initializing model using {MODEL_CLASS.__name__}...")
+    
+    model = MODEL_CLASS.from_pretrained(
         model_name,
-        quantization_config=bnb_config,
-        torch_dtype=torch.bfloat16 if not use_qlora else None,
+        quantization_config=quantization_config, # Fixed: uses the correct variable
         device_map="auto",
-        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa", # Keep SDPA for A40/PyTorch 2.9 compatibility
+        trust_remote_code=True,     # Critical for Qwen3's new architecture
     )
 
-    # Prepare for k-bit training (required for QLoRA)
+    # Prepare for training
     if use_qlora:
         model = prepare_model_for_kbit_training(model)
+    else:
+        # CRITICAL FIX: Enable input gradients for 16-bit LoRA + Gradient Checkpointing
+        # Without this, the frozen base model blocks gradients from flowing to the LoRA adapters.
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+            def make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     # LoRA config
     lora_config = LoraConfig(
@@ -78,21 +92,13 @@ def load_model_and_processor(config: Dict, use_qlora: bool = True):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Trainable params: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
-    print(f"Total params: {total_params:,}")
-
+    
     return model, processor
 
 
 def load_trained_model(checkpoint_path: str, config: Dict):
     """
     Load a trained LoRA model from checkpoint.
-
-    Args:
-        checkpoint_path: Path to saved LoRA adapter
-        config: Config dict
-
-    Returns:
-        (model, processor)
     """
     from peft import PeftModel
 
@@ -101,18 +107,23 @@ def load_trained_model(checkpoint_path: str, config: Dict):
     # Load base model
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
-    # For inference, we can load in 4-bit
+    # For inference, we can load in 4-bit to save memory
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
+    # Use the same systematic loading for inference
+    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
     base_model = Qwen2VLForConditionalGeneration.from_pretrained(
         model_name,
+        config=model_config,
         quantization_config=bnb_config,
         device_map="auto",
-        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa",
     )
 
     # Load LoRA weights
@@ -128,31 +139,17 @@ class GraspModelWrapper:
     """
     Convenience wrapper for inference.
     """
-
     def __init__(self, model, processor, quantizer, config: Dict):
         self.model = model
         self.processor = processor
         self.quantizer = quantizer
         self.config = config
-
         self.model.eval()
 
     @torch.no_grad()
     def predict_grasp(self, image, instruction: str = "",
                       use_constrained: bool = True,
                       temperature: float = 0.2):
-        """
-        Predict grasp for a single image.
-
-        Args:
-            image: PIL Image or numpy array
-            instruction: Optional language instruction
-            use_constrained: Use digits-only logits processor
-            temperature: Sampling temperature
-
-        Returns:
-            Grasp dict with cx, cy, theta, w, h
-        """
         from data.chat_formatter import format_inference_messages
         from model.constrained_decoding import (
             DigitsOnlyLogitsProcessor,
@@ -189,7 +186,6 @@ class GraspModelWrapper:
 
         if bins is None:
             print(f"Warning: Failed to parse output: {generated_text}")
-            # Return dummy grasp
             return {'cx': 320, 'cy': 240, 'theta': 0, 'w': 50, 'h': 100}
 
         # Decode bins to continuous
