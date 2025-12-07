@@ -12,6 +12,13 @@ import sys
 import argparse
 import json
 from pathlib import Path
+
+# Fix tokenizer warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Add parent directory to path so we can import 'model'
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -115,80 +122,94 @@ class GraspVLGEvaluator:
         self.model, self.processor = load_trained_model(checkpoint_path, config)
         self.model.eval()
         
+        # FIX: Decoder-only models need left-padding for batched generation
+        self.processor.tokenizer.padding_side = 'left'
+        
         # Constrained decoding
         from model.constrained_decoding import DigitsOnlyLogitsProcessor
         self.logits_processor = [DigitsOnlyLogitsProcessor(self.processor.tokenizer)]
     
     @torch.no_grad()
-    def predict(self, image, sentence):
+    def predict_batch(self, images, sentences):
         """
-        Predict grasp for given image and referring expression.
+        Predict grasps for a batch of images and sentences.
         
         Args:
-            image: numpy array (H, W, 3)
-            sentence: str, referring expression
+            images: list of numpy arrays (H, W, 3)
+            sentences: list of str
             
         Returns:
-            grasp dict {cx, cy, theta, w, h}
+            list of grasp dicts [{cx, cy, theta, w, h}, ...]
         """
-        # Format messages
-        messages = format_inference_messages(image, instruction=sentence)
+        # Format messages for batch
+        batch_text = []
+        batch_images = []
         
-        # Process
-        text_prompt = self.processor.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=True
-        )
+        for img, sent in zip(images, sentences):
+             messages = format_inference_messages(img, instruction=sent)
+             text = self.processor.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+             )
+             batch_text.append(text)
+             batch_images.append(Image.fromarray(img.astype(np.uint8)))
         
-        pil_image = Image.fromarray(image.astype(np.uint8))
-        
+        # Process batch
         inputs = self.processor(
-            text=[text_prompt],
-            images=[pil_image],
+            text=batch_text,
+            images=batch_images,
+            padding=True,
             return_tensors='pt'
         ).to(self.model.device)
         
+        # Generator args
+        gen_kwargs = {
+            "max_new_tokens": self.config.get('generation_max_tokens', 20),
+            "temperature": self.config.get('generation_temperature', 0.1),
+            "do_sample": self.config.get('generation_temperature', 0.1) > 0,
+        }
+        
+        # Logits processor (cannot act on batch easily if constrained decoding differs, 
+        # but for digits-only it is stateless, so it is fine)
+        if self.config.get('use_constrained_decoding', True):
+             gen_kwargs["logits_processor"] = self.logits_processor
+
         # Generate
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=self.config.get('generation_max_tokens', 20),
-            temperature=self.config.get('generation_temperature', 0.1),
-            do_sample=self.config.get('generation_temperature', 0.1) > 0,
-            logits_processor=self.logits_processor if self.config.get('use_constrained_decoding', True) else None,
-        )
+        outputs = self.model.generate(**inputs, **gen_kwargs)
         
         # Decode
-        generated_text = self.processor.decode(outputs[0], skip_special_tokens=True)
+        # Slicing inputs away: Standard transformers behavior for causal LM is that input is echoed.
+        # However, Qwen3VL might not echo depending on config. Safest is decode all and parse last part.
+        # But commonly we just slice [input_len:]
+        input_len = inputs.input_ids.shape[1]
+        generated_ids = outputs[:, input_len:]
+        generated_texts = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
         
-        # Parse output
+        results = []
         from model.constrained_decoding import parse_grasp_output
-        bins = parse_grasp_output(generated_text)
         
-        if bins is None:
-            # Return center of image as fallback
-            return {
-                'cx': self.config['image_size'][1] / 2,
-                'cy': self.config['image_size'][0] / 2,
-                'theta': 0,
-                'w': 50,
-                'h': 100,
-            }
-        
-        # Decode bins to continuous
-        grasp = self.quantizer.decode(bins)
-        return grasp
-    
-    def evaluate(self, dataset, max_samples=None):
-        """
-        Evaluate on dataset.
-        
-        Args:
-            dataset: GraspVLGEvalDataset
-            max_samples: Max samples to evaluate (None = all)
+        for text in generated_texts:
+            bins = parse_grasp_output(text)
             
-        Returns:
-            dict with metrics
+            if bins is None:
+                # Fallback center
+                grasp = {
+                    'cx': self.config['image_size'][1] / 2,
+                    'cy': self.config['image_size'][0] / 2,
+                    'theta': 0,
+                    'w': 50,
+                    'h': 100,
+                }
+            else:
+                grasp = self.quantizer.decode(bins)
+            results.append(grasp)
+            
+        return results
+    
+    def evaluate(self, dataset, max_samples=None, batch_size=32):
+        """
+        Evaluate on dataset using batched inference.
         """
         results = {
             'predictions': [],
@@ -199,42 +220,66 @@ class GraspVLGEvaluator:
             'ious': [],
         }
         
-        n_samples = len(dataset) if max_samples is None else min(max_samples, len(dataset))
+        # Create subset if max_samples
+        if max_samples is not None:
+             indices = list(range(min(max_samples, len(dataset))))
+             dataset = torch.utils.data.Subset(dataset, indices)
         
-        print(f"\nEvaluating on {n_samples} samples...")
+        # DataLoader
+        # Note: We need a custom collate because images are numpy arrays in the dataset
+        def custom_collate(batch):
+            return {
+                'images': [b['image'] for b in batch],
+                'sentences': [b['sentence'] for b in batch],
+                'grasps': [b['grasps'] for b in batch],
+                'targets': [b['target'] for b in batch]
+            }
+            
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=custom_collate
+        )
         
-        for idx in tqdm(range(n_samples)):
-            sample = dataset[idx]
+        print(f"\nEvaluating on {len(dataset)} samples (Batch size: {batch_size})...")
+        
+        for batch in tqdm(loader):
+            images = batch['images']
+            sentences = batch['sentences']
+            gt_grasps_batch = batch['grasps']
+            targets = batch['targets']
             
-            image = sample['image']
-            sentence = sample['sentence']
-            gt_grasps = sample['grasps']
-            target = sample['target']
-            
-            # Skip if no ground truth
-            if len(gt_grasps) == 0:
-                continue
-            
-            # Predict
+            # Predict Batch
             try:
-                pred_grasp = self.predict(image, sentence)
+                pred_grasps = self.predict_batch(images, sentences)
             except Exception as e:
-                print(f"\nError on sample {idx}: {e}")
-                continue
+                print(f"Batch Error: {e}")
+                # Fallback: predict empty/center for batch to keep alignment, or just crash
+                # Let's crash to debug
+                raise e
             
-            # Check success against ANY valid grasp
-            success, best_iou = check_grasp_success(
-                pred_grasp, gt_grasps,
-                iou_threshold=self.config.get('iou_threshold', 0.25),
-                angle_tolerance=self.config.get('angle_tolerance_deg', 30)
-            )
-            
-            results['predictions'].append(pred_grasp)
-            results['ground_truths'].append(gt_grasps)
-            results['sentences'].append(sentence)
-            results['targets'].append(target)
-            results['successes'].append(success)
-            results['ious'].append(best_iou)
+            # Evaluate Batch
+            for i, pred_grasp in enumerate(pred_grasps):
+                gt_grasps = gt_grasps_batch[i]
+                
+                if len(gt_grasps) == 0:
+                    continue
+
+                success, best_iou = check_grasp_success(
+                    pred_grasp, gt_grasps,
+                    iou_threshold=self.config.get('iou_threshold', 0.25),
+                    angle_tolerance=self.config.get('angle_tolerance_deg', 30)
+                )
+                
+                results['predictions'].append(pred_grasp)
+                results['ground_truths'].append(gt_grasps)
+                results['sentences'].append(sentences[i])
+                results['targets'].append(targets[i])
+                results['successes'].append(success)
+                results['ious'].append(best_iou)
         
         # Compute metrics
         metrics = self._compute_metrics(results)
@@ -338,7 +383,7 @@ def main(args):
     evaluator = GraspVLGEvaluator(args.checkpoint, config)
 
     # Evaluate
-    results = evaluator.evaluate(dataset, max_samples=args.max_samples)
+    results = evaluator.evaluate(dataset, max_samples=args.max_samples, batch_size=args.batch_size)
 
     # Print results
     print_metrics(results['metrics'], title=f"OCID-VLG {config['dataset_version']}/{args.split}")
@@ -427,6 +472,8 @@ if __name__ == '__main__':
                         help='Config variant')
     parser.add_argument('--max_samples', type=int, default=None,
                         help='Max samples to evaluate (for quick tests)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size for inference')
     parser.add_argument('--visualize', action='store_true',
                         help='Generate visualizations')
 
