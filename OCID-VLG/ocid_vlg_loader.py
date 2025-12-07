@@ -96,14 +96,73 @@ class OCIDVLGDataset:
     
     def _load_image(self, img_path: str) -> np.ndarray:
         """Load RGB image."""
-        full_path = self.root_dir / img_path
-        if not full_path.exists():
-            # Try finding it in 'images' subdir if not found directly
-            # Some datasets put ARID20/ inside images/
-            alt_path = self.root_dir / "images" / img_path
-            if alt_path.exists():
-                full_path = alt_path
+        # FIX: The JSON uses "seq06,result..." but filesystem is "seq06/result..."
+        # We need to handle this discrepancy.
+        img_path_fixed = img_path.replace(',', '/')
         
+        full_path = self.root_dir / img_path_fixed
+        if not full_path.exists():
+            # Fallback: maybe it really is a comma? (Unlikely given the debug output)
+            full_path_original = self.root_dir / img_path
+            if full_path_original.exists():
+                full_path = full_path_original
+            else:
+                # Try finding it in 'images' subdir
+                alt_path = self.root_dir / "images" / img_path_fixed
+                if alt_path.exists():
+                    full_path = alt_path
+                else:
+                    # FIX: OCID structure often puts images in 'rgb' folder
+                    # e.g., seq06/rgb/result_...
+                    # We need to insert 'rgb' before the filename
+                    parent_dir = (self.root_dir / img_path_fixed).parent
+                    filename = (self.root_dir / img_path_fixed).name
+                    rgb_path = parent_dir / "rgb" / filename
+                    
+                    if rgb_path.exists():
+                        full_path = rgb_path
+                    else:
+                        # DEBUGGING BLOCK: Deep Path Walker 
+                        # (Keep this just in case, but use the fixed path)
+                        print(f"\n[ERROR] Image not found: {full_path}")
+                        pass # The rest of the debug block can stay or execute on failure
+        
+        # If we reached here without existing, let the debug block below run or crash
+        
+        if not full_path.exists():
+                # DEBUGGING BLOCK: Deep Path Walker
+                print(f"\n[ERROR] Image not found: {full_path}")
+                print(f"  Root: {self.root_dir.resolve()}")
+                
+                # Check path components using the FIXED path
+                parts = Path(img_path_fixed).parts
+                current = self.root_dir
+                for i, part in enumerate(parts):
+                    next_level = current / part
+                    if not next_level.exists():
+                        print(f"  [BREAKPOINT] Found '{current.name}' but could not find '{part}' inside it.")
+                        # Check ignore case
+                        candidates = list(current.glob(part + '*'))
+                        if candidates:
+                            print(f"  Did you mean? {[c.name for c in candidates]}")
+                        else:
+                            # List sibling dirs
+                            try:
+                                siblings = [p.name for p in current.iterdir()]
+                                print(f"  Contents of '{current.name}': {siblings[:10]} ... ({len(siblings)} items)")
+                            except Exception as e:
+                                print(f"  Could not list contents: {e}")
+                        break
+                    
+                    # If this is the last part (the file) and it doesn't exist (but folder does)
+                    if i == len(parts) - 1 and not next_level.exists():
+                         print(f"  [BREAKPOINT] File '{part}' missing in '{current.name}'.")
+                         siblings = [p.name for p in current.iterdir()]
+                         print(f"  Folder contents: {siblings[:10]}")
+                         
+                    current = next_level
+
+
         img = Image.open(full_path).convert('RGB')
         return np.array(img)
     
@@ -186,7 +245,7 @@ class OCIDVLGDataset:
                 # Let's map len1 -> w, len2 -> h (arbitrary but consistent)
                 # And theta is angle of len1
                 w, h = len1, len2
-                angle_deg = np.degrees(np.arctan2(dy1, dx1))
+                angle = np.degrees(np.arctan2(dy1, dx1)) # FIX: variable name was angle_deg
                 
                 target_idx = 0 # Default if not provided
                 

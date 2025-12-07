@@ -66,13 +66,14 @@ class GraspDataCollator:
         )
 
         # 5. Process PROMPT Batch (Just to measure lengths)
-        # padding=False gives us the exact unpadded length of the question+image
+        # padding=False + return_tensors=None gives us lists of ids
+        # We need this to get exact length of the prompt part per sample
         with torch.no_grad():
             prompt_batch = self.processor(
                 text=prompt_texts,
                 images=images,
                 padding=False, 
-                return_tensors='pt' 
+                return_tensors=None # Returns python lists, avoids "expected sequence of length..." error
             )
             
         # 6. Create Labels
